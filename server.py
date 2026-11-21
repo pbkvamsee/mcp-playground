@@ -1,226 +1,278 @@
-"""Railway POC: browser REST API + existing FastMCP + Poppy discovery + Descope OAuth.
 
-Protected REST calls validate JWT signature, issuer, audience, scopes, and
-(optional but enabled by default) live token introspection. This is NOT a
-full Poppy agent-session verifier; Poppy-Session claims are never trusted.
-"""
 import os
-from functools import lru_cache
-from html import escape
+import logging
 
-import httpx
-import jwt
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Security, status
+
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.security import OAuth2AuthorizationCodeBearer, SecurityScopes
+
 from fastmcp import FastMCP
-from fastmcp.server.auth import RemoteAuthProvider
+from fastmcp.server.auth import require_scopes
+from fastmcp.server.auth.providers.descope import DescopeProvider
 from fastmcp.server.auth.providers.jwt import JWTVerifier
-from pydantic import AnyHttpUrl
-from jwt import PyJWKClient
-from jwt.exceptions import PyJWTError
-
-DOMAIN = os.getenv("PUBLIC_DOMAIN", "mcp-playground-production.up.railway.app").strip().removeprefix("https://").strip("/")
-ORIGIN = f"https://{DOMAIN}"
-DESCOPE_PROJECT_ID = os.getenv("DESCOPE_PROJECT_ID", "P3ML27ocPWZS6vulRanlFpjFkO20")
-DESCOPE_BASE_URL = os.getenv("DESCOPE_BASE_URL", "https://api.descope.com").rstrip("/")
-DESCOPE_ISSUER = os.getenv("DESCOPE_ISSUER", f"{DESCOPE_BASE_URL}/v1/apps/{DESCOPE_PROJECT_ID}")
-# Read this exact HTTPS URL from your Descope discovery document's 'jwks_uri'.
-DESCOPE_JWKS_URL = os.getenv("DESCOPE_JWKS_URL", "").strip()
-DESCOPE_CLIENT_ID = os.getenv("DESCOPE_CLIENT_ID", "").strip()
-DESCOPE_CLIENT_SECRET = os.getenv("DESCOPE_CLIENT_SECRET", "").strip()
-# API audience must exactly match the Resource identifier registered in Descope.
-RESOURCE_ID = ORIGIN
-HELLO_SCOPE = "hello:read"
-INTROSPECT_URL = f"{DESCOPE_BASE_URL}/oauth2/v1/apps/introspect"
 
 
-def hello(name: str) -> str:
-    return f"Hello {name}! This message is coming from my MCP server in the cloud."
+# ==========================================
+# 1. Configuration
+# ==========================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mcp-playground")
+
+DESCOPE_PROJECT_ID = "P3ML27ocPWZS6vulRanlFpjFkO20"
+
+BASE_URL = (
+    "https://mcp-playground-production.up.railway.app"
+)
+
+MCP_SERVER_URL = f"{BASE_URL}/mcp"
+
+DESCOPE_ISSUER = (
+    f"https://api.descope.com/v1/apps/"
+    f"{DESCOPE_PROJECT_ID}"
+)
+
+DESCOPE_CONFIG_URL = (
+    f"{DESCOPE_ISSUER}"
+    "/.well-known/openid-configuration"
+)
+
+DESCOPE_JWKS_URL = (
+    f"https://api.descope.com/"
+    f"{DESCOPE_PROJECT_ID}"
+    "/.well-known/jwks.json"
+)
+
+PORT = int(os.environ.get("PORT", "8080"))
 
 
-# FastMCP checks OAuth bearer tokens on the /mcp endpoint. There is no
-# anonymous MCP mode: missing/invalid authorization fails closed.
-# Set DESCOPE_JWKS_URL to the jwks_uri in Descope's OAuth discovery document.
-if not DESCOPE_JWKS_URL.startswith("https://"):
-    raise RuntimeError("DESCOPE_JWKS_URL must be set to Descope's HTTPS jwks_uri")
+# ==========================================
+# 2. Descope JWT verification
+# ==========================================
 
-mcp_verifier = JWTVerifier(
+# Validate:
+# - JWT signature using Descope JWKS
+# - Descope issuer
+# - Exact MCP resource audience
+# - Token expiration
+
+token_verifier = JWTVerifier(
     jwks_uri=DESCOPE_JWKS_URL,
     issuer=DESCOPE_ISSUER,
-    audience=RESOURCE_ID,
-    required_scopes=[HELLO_SCOPE],
+    audience=MCP_SERVER_URL,
+    algorithm="RS256",
 )
-mcp_auth = RemoteAuthProvider(
-    token_verifier=mcp_verifier,
-    authorization_servers=[AnyHttpUrl(DESCOPE_ISSUER)],
-    base_url=ORIGIN,
-    scopes_supported=[HELLO_SCOPE],
-)
-mcp = FastMCP("My First MCP Server", auth=mcp_auth)
 
 
-@mcp.tool
-async def say_hello(name: str) -> str:
-    """Say hello to someone by name (requires Descope hello:read scope)."""
+# ==========================================
+# 3. Descope OAuth provider
+# ==========================================
+
+auth_provider = DescopeProvider(
+    config_url=DESCOPE_CONFIG_URL,
+    base_url=BASE_URL,
+    scopes_supported=["hello:read"],
+    required_scopes=["hello:read"],
+    token_verifier=token_verifier,
+)
+
+
+# ==========================================
+# 4. MCP Server
+# ==========================================
+
+mcp = FastMCP(
+    name="My Descope Protected MCP Server",
+    auth=auth_provider,
+)
+
+
+# ==========================================
+# 5. Business Logic
+# ==========================================
+
+def hello(name: str) -> str:
+    return (
+        f"Hello {name}! "
+        "This message is coming from my "
+        "MCP server in the cloud."
+    )
+
+
+# ==========================================
+# 6. Protected MCP Tool
+# ==========================================
+
+@mcp.tool(auth=require_scopes("hello:read"))
+def say_hello(name: str) -> str:
+    """
+    Say hello to someone by name.
+
+    Requires Descope OAuth authentication
+    and the hello:read permission.
+    """
+
+    logger.info("Executing say_hello tool")
+
     return hello(name)
 
 
-mcp_app = mcp.http_app(path="/mcp")
-app = FastAPI(title="MCP & Poppy Playground", version="2.0.0", lifespan=mcp_app.lifespan)
+# ==========================================
+# 7. FastAPI Web Application
+# ==========================================
 
-oauth2_scheme = OAuth2AuthorizationCodeBearer(
-    authorizationUrl=f"{DESCOPE_BASE_URL}/oauth2/v1/apps/authorize",
-    tokenUrl=f"{DESCOPE_BASE_URL}/oauth2/v1/apps/token",
-    scopes={HELLO_SCOPE: "Call the protected Hello World REST API"},
+# Preserve MCP's startup/shutdown lifecycle.
+mcp_app = mcp.http_app(path="/mcp")
+
+app = FastAPI(
+    title="MCP + Descope + Poppy Playground",
+    version="2.0.0",
+    lifespan=mcp_app.lifespan,
 )
 
 
-@lru_cache(maxsize=1)
-def jwks_client() -> PyJWKClient:
-    if not DESCOPE_JWKS_URL.startswith("https://"):
-        raise HTTPException(503, "DESCOPE_JWKS_URL must be configured with the issuer's HTTPS jwks_uri")
-    return PyJWKClient(DESCOPE_JWKS_URL, cache_jwk_set=True, lifespan=300, timeout=5)
+# ==========================================
+# 8. Browser Homepage
+# ==========================================
 
+@app.get("/", response_class=HTMLResponse)
+async def homepage():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>MCP Playground</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 750px;
+                margin: 80px auto;
+                padding: 20px;
+                line-height: 1.8;
+            }
+            h1 { color: #333; }
+            a { color: #0066cc; }
+        </style>
+    </head>
+    <body>
+        <h1>MCP + Descope + Poppy Playground</h1>
 
-async def require_descope_token(
-    security_scopes: SecurityScopes,
-    token: str = Depends(oauth2_scheme),
-) -> dict:
-    """Fail-closed resource-server authentication and authorization.
+        <p>Application is running successfully.</p>
 
-    This only authorizes the *OAuth user/account*. It does not authenticate
-    Poppy-Session agent identity or validate DPoP sender constraints.
+        <h3>Available Endpoints</h3>
+
+        <ul>
+            <li>
+                <a href="/hello?name=Kishore">
+                    Public Hello World REST API
+                </a>
+            </li>
+
+            <li>
+                <a href="/.well-known/poppy.json">
+                    Poppy Discovery
+                </a>
+            </li>
+
+            <li>
+                <a href="/.well-known/oauth-protected-resource/mcp">
+                    OAuth Protected Resource Metadata
+                </a>
+            </li>
+
+            <li>
+                <a href="/docs">
+                    Swagger Documentation
+                </a>
+            </li>
+        </ul>
+
+        <p>
+            MCP endpoint: <strong>/mcp</strong>
+            (Descope authentication required)
+        </p>
+    </body>
+    </html>
     """
-    challenge = f'Bearer realm="{RESOURCE_ID}"'
-    try:
-        signing_key = jwks_client().get_signing_key_from_jwt(token).key
-        claims = jwt.decode(
-            token,
-            signing_key,
-            algorithms=["RS256", "ES256"],
-            issuer=DESCOPE_ISSUER,
-            audience=RESOURCE_ID,
-            options={"require": ["exp", "iss", "aud", "sub"]},
-            leeway=30,
-        )
-    except HTTPException:
-        raise
-    except (PyJWTError, ValueError, OSError) as exc:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired access token",
-            headers={"WWW-Authenticate": challenge},
-        ) from exc
-
-    raw_scopes = claims.get("scope", "")
-    token_scopes = set(raw_scopes.split()) if isinstance(raw_scopes, str) else set(raw_scopes) if isinstance(raw_scopes, list) else set()
-    for required_scope in security_scopes.scopes:
-        if required_scope not in token_scopes:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Missing required scope: {required_scope}",
-                headers={"WWW-Authenticate": f'{challenge}, error="insufficient_scope", scope="{required_scope}"'},
-            )
-
-    # RFC 7662: check live status so a revoked token is not honored until expiry.
-    # Configure a confidential OAuth client authorized to introspect these tokens.
-    if not DESCOPE_CLIENT_ID or not DESCOPE_CLIENT_SECRET:
-        raise HTTPException(503, "Descope introspection client credentials are not configured")
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            response = await client.post(
-                INTROSPECT_URL,
-                data={"token": token, "token_type_hint": "access_token"},
-                auth=(DESCOPE_CLIENT_ID, DESCOPE_CLIENT_SECRET),
-            )
-            response.raise_for_status()
-            info = response.json()
-        if info.get("active") is not True:
-            raise HTTPException(401, "Token is inactive", headers={"WWW-Authenticate": challenge})
-        # Where Descope returns these fields, require them to agree with the JWT.
-        if "aud" in info:
-            audiences = info["aud"] if isinstance(info["aud"], list) else [info["aud"]]
-            if RESOURCE_ID not in audiences:
-                raise HTTPException(401, "Introspection audience mismatch", headers={"WWW-Authenticate": challenge})
-        if "sub" in info and info["sub"] != claims["sub"]:
-            raise HTTPException(401, "Introspection subject mismatch", headers={"WWW-Authenticate": challenge})
-    except HTTPException:
-        raise
-    except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(503, "Unable to validate token status with Descope") from exc
-    return claims
 
 
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def homepage():
-    safe_domain = escape(DOMAIN)
-    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'>
-<meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>MCP &amp; Poppy Playground</title>
-<style>body{{font:16px system-ui,sans-serif;max-width:750px;margin:5rem auto;padding:1.3rem;line-height:1.7}}
-a{{color:#1357a6}}code{{background:#f2f4f7;padding:3px 6px}}li{{margin:10px 0}}</style>
-</head><body><h1>MCP &amp; Poppy Playground</h1>
-<p>Running on <strong>{safe_domain}</strong></p><ul>
-<li><a href='/hello?name=Kishore'>Public Hello World REST API</a></li>
-<li><a href='/docs'>OpenAPI documentation (protected endpoint included)</a></li>
-<li><a href='/.well-known/poppy.json'>Poppy discovery</a></li>
-<li><a href='/.well-known/oauth-protected-resource'>OAuth protected-resource metadata</a></li>
-<li><a href='/health'>Health check</a></li>
-</ul><p>MCP endpoint: <code>/mcp</code> (use an MCP client, not the browser).</p>
-<p>Protected endpoint: <code>/api/hello?name=Kishore</code> — requires a valid Descope access token with <code>hello:read</code>.</p>
-<p><small>Protected MCP: Descope login is mandatory. Only the public /hello demo is anonymous.</small></p>
-</body></html>"""
-
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
-
+# ==========================================
+# 9. Public REST API
+# ==========================================
 
 @app.get("/hello")
-def public_hello(name: str = "World"):
-    return {"result": hello(name)}
+async def rest_hello(name: str = "World"):
+    return {
+        "result": hello(name)
+    }
 
 
-@app.get("/api/hello")
-async def protected_hello(name: str = "World", claims: dict = Security(require_descope_token, scopes=[HELLO_SCOPE])):
-    # Deliberately does not read Poppy-Session or treat unverified client data as identity.
-    return {"result": hello(name), "authenticated_subject": claims["sub"]}
+# ==========================================
+# 10. Health Check
+# ==========================================
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "service": "mcp-playground",
+        "authentication": "descope"
+    }
 
 
-@app.get("/.well-known/poppy.json", include_in_schema=False)
-def poppy_discovery():
-    return JSONResponse({
-        "protocol_version": "1.0",
-        "organization": {"name": "MCP Playground", "domain": DOMAIN},
-        "auth": {
-            "issuer": DESCOPE_ISSUER,
-            "scopes": {HELLO_SCOPE: "Read a personalized Hello World response"},
-            "scope_hints": {HELLO_SCOPE: {"changes": "none", "personal_data": False}},
-        },
-        "apis": [{
-            "type": "openapi",
-            "url": f"{ORIGIN}/openapi.json",
-            "description": "Public and OAuth-protected Hello World APIs",
-        }],
-        "web": {},
-    })
+# ==========================================
+# 11. Poppy Discovery
+# ==========================================
+
+@app.get("/.well-known/poppy.json")
+async def poppy_discovery():
+    return JSONResponse(
+        content={
+            "protocol_version": "1.0",
+            "organization": {
+                "name": "MCP Playground",
+                "domain": (
+                    "mcp-playground-production"
+                    ".up.railway.app"
+                )
+            },
+            "web": {}
+        }
+    )
 
 
-@app.get("/.well-known/oauth-protected-resource", include_in_schema=False)
-def oauth_protected_resource():
-    return JSONResponse({
-        "resource": RESOURCE_ID,
-        "authorization_servers": [DESCOPE_ISSUER],
-        "scopes_supported": [HELLO_SCOPE],
-    })
+# ==========================================
+# 12. Mount MCP and OAuth Discovery
+# ==========================================
 
+# Mount at root so FastMCP can serve:
+#
+# /mcp
+# /.well-known/oauth-protected-resource
+# /.well-known/oauth-protected-resource/mcp
+#
+# FastAPI routes above take precedence.
+# MCP authentication remains enforced
+# by FastMCP's own middleware.
 
-# Keep existing /mcp URL. Mount last so FastAPI routes resolve first.
 app.mount("/", mcp_app)
 
 
+# ==========================================
+# 13. Railway Startup
+# ==========================================
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+    logger.info("Starting MCP Playground")
+    logger.info("MCP URL: %s", MCP_SERVER_URL)
+    logger.info("Descope issuer: %s", DESCOPE_ISSUER)
+    logger.info("Required scope: hello:read")
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info"
+    )
