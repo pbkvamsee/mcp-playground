@@ -1,49 +1,44 @@
-# MCP Playground — Descope login required for MCP
+# MCP Airline Playground — all 8 airline tools
 
-This version **requires Descope OAuth tokens for all MCP traffic** at `/mcp`. The public `/hello` REST demonstration and website remain reachable without authentication. The separately protected `/api/hello` retains its JWT + introspection sample, which requires confidential client credentials.
+Complete replacement for your existing `mcp-playground` GitHub repository files. Designed for your existing Railway domain and Descope/PingOne configuration.
 
-## 1. Descope setup (before deploying)
+## Files
 
-In Descope project `P3ML27ocPWZS6vulRanlFpjFkO20`:
+- `server.py`: FastMCP server with 8 synthetic airline tools plus existing `say_hello`.
+- `requirements.txt`: dependencies for Railway.
 
-1. Under Agentic Identity Hub > MCP Servers (or Resources), register the existing MCP URL `https://mcp-playground-production.up.railway.app/mcp` according to the Descope console. **Resource identifier / token audience must match** `https://mcp-playground-production.up.railway.app`, because this project uses that HTTPS origin for the OAuth resource metadata and JWT audience. If Descope requires the MCP URL as its Resource identifier instead, update `RESOURCE_ID` in server.py and the protected resource metadata to the **exact same value** before testing.
-2. Add permission `hello:read` and consent text `Use the Hello World tool`.
-3. Configure an interactive user-consent/login flow.
-4. Under Project Settings > OIDC > Client Registration, enable **CIMD** and allow Anthropic's Claude published client metadata domain as an approved domain; or enable DCR and choose **Register automatically** in Claude. Verify what the project's issuer actually publishes in OAuth discovery.
-5. From the Descope authorization server discovery metadata, copy the **exact `jwks_uri`**. Do not guess a URL.
+## Deployment
 
-## 2. Railway
+1. **Unzip**. Upload/replace `server.py` and `requirements.txt` in the **root** of `pbkvamsee/mcp-playground` on GitHub; optionally upload this README. Do not upload the ZIP directly as a deployable source file.
+2. Commit to your deploy branch. Railway should build automatically.
+3. Keep Railway start command `python server.py` and configured port `8080` (or let Railway inject `PORT`).
+4. Existing Descope project ID, OAuth issuer, JWKS URL, `/mcp` resource audience, and `hello:read` scope are preserved. There is **no new Descope scope configuration** for this build.
+5. Visit `https://mcp-playground-production.up.railway.app/health` to verify `total_tools: 9`.
+6. Reconnect or refresh your existing Claude `test` MCP connector if necessary and ask it to list tools.
 
-Upload the extracted project files to GitHub, overwriting the old versions. Set these Railway service variables:
+## Tools
 
-- `DESCOPE_JWKS_URL` = the exact `jwks_uri` from Descope's discovery (required; deployment fails closed if omitted)
-- `PUBLIC_DOMAIN` = `mcp-playground-production.up.railway.app`
-- `DESCOPE_PROJECT_ID` = `P3ML27ocPWZS6vulRanlFpjFkO20`
-- `DESCOPE_ISSUER` = `https://api.descope.com/v1/apps/P3ML27ocPWZS6vulRanlFpjFkO20`
-- `DESCOPE_CLIENT_ID` and `DESCOPE_CLIENT_SECRET` = confidential client allowed to introspect tokens (only necessary for the **separate** `/api/hello` REST demo)
+| Tool | Test inputs | Notes |
+| --- | --- | --- |
+| `say_hello` | `name="Kishore"` | Original Hello World |
+| `search_flights` | `origin="ORD", destination="IST", departure_date="2026-12-15"` | Returns fictional DEMO101/DEMO202 |
+| `get_flight_status` | `flight_number="DEMO101"` | Simulated status |
+| `lookup_airport` | `airport_code="ORD"` | 7 sample airports |
+| `get_booking` | `booking_reference="DEMO123"` | Fictional passenger and reservation |
+| `get_baggage_allowance` | `cabin="Economy"` | Fictional policy |
+| `get_available_seats` | `flight_number="DEMO101", cabin="Economy"` | Fictional seats |
+| `get_miles_balance` | (no parameters) | Fictional account with 45,000 miles |
+| `create_checkout_link` | `flight_number="DEMO101", origin="ORD", destination="IST", departure_date="2026-12-15"` | Demo URL only; no reservation/payment |
 
-Keep Railway start command `python server.py`. Keep Railway public Networking target set to the actual `PORT` shown in deployment logs (earlier: 8080).
+## Suggested Claude test
 
-## 3. Verify BEFORE asking Claude to connect
+> Use my test MCP server to find flights from ORD to IST on 2026-12-15. Look up ORD, check the status and available economy seats for DEMO101, retrieve booking DEMO123, check economy baggage rules and my **demo** loyalty balance, then create a **demo** checkout link for DEMO101. Use only MCP tools; show the results and identify all data as simulated.
 
-```bash
-curl -i https://mcp-playground-production.up.railway.app/mcp
-```
+## Security
 
-Expected: HTTP 401 and `WWW-Authenticate: Bearer ...` (not 406, 502, or 200). Test authenticated OAuth metadata:
-
-```bash
-curl -i https://mcp-playground-production.up.railway.app/.well-known/oauth-protected-resource
-curl -i https://mcp-playground-production.up.railway.app/.well-known/poppy.json
-```
-
-Then in Claude Desktop: add a **new** custom connector URL `https://mcp-playground-production.up.railway.app/mcp`, choose **Sign in now** and **Use Claude's published identity** (when CIMD enabled), or **Register automatically** (when DCR enabled). Complete Descope login/consent. Note that existing unauthenticated Claude Code config will need reauthentication.
-
-## Security boundaries
-
-- The MCP transport rejects missing, expired, malformed, wrong-audience, wrong-issuer or missing-scope JWTs through `RemoteAuthProvider` + `JWTVerifier`.
-- This is **not** proof of cryptographic agent request identity (e.g. signed Poppy Session), DPoP, or immediate OAuth revocation. The FastMCP JWT verifier checks JWTs locally and may honor a revoked token until expiry. For live revocation, implement and test a compatible Descope introspection/token verification layer.
-- `/.well-known` metadata and `/hello` intentionally remain public.
-- Do not commit secrets.
-
-References: https://gofastmcp.com/docs/servers/auth/remote-oauth and https://docs.descope.com/agentic-identity-hub/core-components/mcp-servers
+- MCP endpoint stays OAuth-protected via `RemoteAuthProvider` and `JWTVerifier`.
+- For this POC **all nine tools** require the existing `hello:read` scope. This is deliberately coarse-grained. Next iteration: split into `flights:read`, `bookings:read`, `profile:read`, and `bookings:write` and configure them in Descope.
+- `/health`, `/`, `/hello`, and `/demo/checkout` are intentionally public informational/demo endpoints. No real personal data is exposed.
+- All airline values are hardcoded demo fixtures. No external airline API, user lookup, payment, or booking writes.
+- `/.well-known/poppy.json` is a basic placeholder only, **not** full Poppy support.
+- Code syntax is checked locally; runtime interoperability with your Railway/Descope deployment needs validation after deployment.
