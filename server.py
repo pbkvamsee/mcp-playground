@@ -15,6 +15,9 @@ from fastapi import Depends, FastAPI, HTTPException, Security, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import OAuth2AuthorizationCodeBearer, SecurityScopes
 from fastmcp import FastMCP
+from fastmcp.server.auth import RemoteAuthProvider
+from fastmcp.server.auth.providers.jwt import JWTVerifier
+from pydantic import AnyHttpUrl
 from jwt import PyJWKClient
 from jwt.exceptions import PyJWTError
 
@@ -37,12 +40,30 @@ def hello(name: str) -> str:
     return f"Hello {name}! This message is coming from my MCP server in the cloud."
 
 
-mcp = FastMCP("My First MCP Server")
+# FastMCP checks OAuth bearer tokens on the /mcp endpoint. There is no
+# anonymous MCP mode: missing/invalid authorization fails closed.
+# Set DESCOPE_JWKS_URL to the jwks_uri in Descope's OAuth discovery document.
+if not DESCOPE_JWKS_URL.startswith("https://"):
+    raise RuntimeError("DESCOPE_JWKS_URL must be set to Descope's HTTPS jwks_uri")
+
+mcp_verifier = JWTVerifier(
+    jwks_uri=DESCOPE_JWKS_URL,
+    issuer=DESCOPE_ISSUER,
+    audience=RESOURCE_ID,
+    required_scopes=[HELLO_SCOPE],
+)
+mcp_auth = RemoteAuthProvider(
+    token_verifier=mcp_verifier,
+    authorization_servers=[AnyHttpUrl(DESCOPE_ISSUER)],
+    base_url=ORIGIN,
+    scopes_supported=[HELLO_SCOPE],
+)
+mcp = FastMCP("My First MCP Server", auth=mcp_auth)
 
 
 @mcp.tool
 async def say_hello(name: str) -> str:
-    """Say hello to someone by name (public demo MCP tool)."""
+    """Say hello to someone by name (requires Descope hello:read scope)."""
     return hello(name)
 
 
@@ -149,7 +170,7 @@ a{{color:#1357a6}}code{{background:#f2f4f7;padding:3px 6px}}li{{margin:10px 0}}<
 <li><a href='/health'>Health check</a></li>
 </ul><p>MCP endpoint: <code>/mcp</code> (use an MCP client, not the browser).</p>
 <p>Protected endpoint: <code>/api/hello?name=Kishore</code> — requires a valid Descope access token with <code>hello:read</code>.</p>
-<p><small>POC: MCP and public /hello are unauthenticated. Do not put customer data here.</small></p>
+<p><small>Protected MCP: Descope login is mandatory. Only the public /hello demo is anonymous.</small></p>
 </body></html>"""
 
 
